@@ -1,0 +1,88 @@
+# Standard Coder Platform - Resumable Pipeline Configuration
+#
+# Run:
+#   standard-coder pipeline --config pipeline_config.toml
+
+[repos]
+include_paths = ["~/work/code/personal/standard_coder_platform"]
+exclude_paths = ["*/node_modules/*", "*/.venv/*", "*/vendor/*"]
+max_commits_per_repo = 20000
+
+[filters.authors]
+include = ["emmett08", "Emmett Miller", "emmett.miller7@outlook.com"]
+exclude = ["bot", "dependabot", "renovate", "github-actions"]
+
+[filters.repos]
+include = ["standard-coder-platform"]
+exclude = []
+
+[filters.languages]
+include = ["python", "toml", "markdown", "json"]
+exclude = ["unknown"]
+
+[outputs]
+base_dir = "~/.standard_coder"
+raw_dir = "raw"
+features_dir = "features"
+labels_dir = "labels"
+models_dir = "models"
+forecasts_dir = "forecasts"
+reports_dir = "reports"
+logs_dir = "logs"
+checkpoints_dir = "checkpoints"
+
+[training]
+predictor_kind = "mdn"
+label_samples_per_commit = 50
+rng_seed = 123
+
+[training.hmm]
+kind = "hmm"
+step_minutes = 5
+epochs = 250
+lr = 0.01
+hidden_size = 16
+min_commits_per_author = 50
+device = "mps"
+
+[training.change_rep]
+use_upgrade_a = true
+tokens_max_features = 512
+tokens_min_df = 2
+
+[training.mdn]
+n_components = 10
+hidden_sizes = [128, 64, 64]
+epochs = 60
+lr = 0.001
+batch_size = 512
+truncate_low = 0.0
+truncate_high = 1.0
+device = "mps"
+
+[training.quantile]
+quantiles = [0.5, 0.8, 0.9]
+hidden_sizes = [128, 64, 64]
+epochs = 60
+lr = 0.001
+batch_size = 512
+device = "mps"
+
+[checkpointing]
+save_every_epochs = 1
+resume = true
+
+[forecasting]
+enable = true
+n_sims = 5000
+rng_seed = 123
+sprint_inputs_path = ""
+historical_outcomes_path = ""
+
+[training.multitask]
+enable = false
+pull_requests_path = ""
+epochs = 60
+lr = 0.001
+batch_size = 256
+device = "mps"

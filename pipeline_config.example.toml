@@ -35,7 +35,7 @@ exclude = ["unknown"]
 
 [outputs]
 # Base output folder; created automatically.
-base_dir = "~/standard_coder_outputs"
+base_dir = "~/.standard_coder"
 
 # Subdirectories; created automatically.
 raw_dir = "raw"
