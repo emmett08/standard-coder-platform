@@ -10,12 +10,28 @@
 #   standard-coder pipeline --config pipeline_config.toml
 
 [repos]
+# Repo source: "local" or "github"
+source = "local"
+
 # Local repository discovery via glob patterns.
 # Examples:
 #   include_paths = ["~/code/*", "~/work/*"]
 #   include_paths = ["/Volumes/Work/Repos/*"]
 include_paths = ["~/code/*"]
 exclude_paths = ["*/node_modules/*", "*/.venv/*", "*/vendor/*"]
+
+# Optional aliases for local repo paths.
+# include_local_paths = []
+# exclude_local_paths = []
+
+# GitHub repo list (owner/repo). Used when source="github" or for ingestion.
+include_github_repos = []
+exclude_github_repos = []
+
+# Mirror clone settings (GitHub source).
+mirror_clone = true
+git_fetch_prune = true
+
 max_commits_per_repo = 20000
 
 [filters.authors]
@@ -38,6 +54,7 @@ exclude = ["unknown"]
 base_dir = "~/.standard_coder"
 
 # Subdirectories; created automatically.
+repos_dir = "repos"
 raw_dir = "raw"
 features_dir = "features"
 labels_dir = "labels"
@@ -109,13 +126,42 @@ rng_seed = 123
 sprint_inputs_path = ""
 historical_outcomes_path = ""
 
+# Optional historical sprint outcomes to fit throughput (preferred over samples).
+# Expected format: a JSON list of {"done_effort_hours": 60.0, "workdays": 10}.
+historical_sprints_path = ""
+
+# Fallback for ZenHub or inputs that only have story points.
+story_points_to_sch = 2.0
+story_points_cv = 0.5
+
 
 [training.multitask]
 # Upgrade C: total effort via multi-task outputs (coding + delivery).
-# Provide a PR metadata JSON file (see examples/prs.example.json).
+# Provide a PR metadata JSON file (see examples/prs.example.json),
+# or leave blank to use GitHub ingestion if enabled.
 enable = false
 pull_requests_path = ""
 epochs = 60
 lr = 0.001
 batch_size = 256
 device = "mps"
+
+[github]
+# Optional GitHub ingestion for PR metadata (Upgrade C).
+enabled = false
+token_env_var = "GITHUB_TOKEN"
+api_base_url = "https://api.github.com"
+pulls_since = "2024-01-01T00:00:00Z"
+ingest_reviews = true
+ingest_check_runs = false
+clone_url_template = "https://github.com/{owner}/{repo}.git"
+
+[zenhub]
+# Optional ZenHub ingestion for sprint backlog + estimates.
+enabled = false
+token_env_var = "ZENHUB_TOKEN"
+api_base_url = "https://api.zenhub.com"
+mode = "milestones"
+default_sprint_length_days = 10
+working_days = [0, 1, 2, 3, 4]
+milestone_title_prefix = "Sprint"

@@ -60,9 +60,27 @@ def _match_one(value_lower: str, pattern: str) -> bool:
     return p.lower() in value_lower
 
 
+def _merge_paths(primary: list[str], secondary: list[str]) -> list[str]:
+    if not primary and not secondary:
+        return []
+    if not primary:
+        return list(secondary)
+    if not secondary:
+        return list(primary)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in primary + secondary:
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
 class RepoDiscoveryConfig(BaseModel):
     """How to find repositories on disk."""
 
+    source: str = Field(default="local", description="local | github")
     include_paths: list[str] = Field(
         default_factory=list,
         description="Glob patterns of local repo paths, e.g. '~/code/*'.",
@@ -71,10 +89,34 @@ class RepoDiscoveryConfig(BaseModel):
         default_factory=list,
         description="Glob patterns to ignore.",
     )
+    include_local_paths: list[str] = Field(
+        default_factory=list,
+        description="Alias for include_paths (used by GitHub/ZenHub configs).",
+    )
+    exclude_local_paths: list[str] = Field(
+        default_factory=list,
+        description="Alias for exclude_paths (used by GitHub/ZenHub configs).",
+    )
+    include_github_repos: list[str] = Field(
+        default_factory=list,
+        description="GitHub repositories to ingest, e.g. owner/repo.",
+    )
+    exclude_github_repos: list[str] = Field(
+        default_factory=list,
+        description="Glob patterns to exclude GitHub repos.",
+    )
+    mirror_clone: bool = Field(default=True, description="Use --mirror when cloning GitHub repos.")
+    git_fetch_prune: bool = Field(default=True, description="Use --prune when fetching GitHub repos.")
     max_commits_per_repo: int = Field(
         default=20000,
         description="Safety cap. Set higher if you need deeper history.",
     )
+
+    def local_include_paths(self) -> list[str]:
+        return _merge_paths(self.include_paths, self.include_local_paths)
+
+    def local_exclude_paths(self) -> list[str]:
+        return _merge_paths(self.exclude_paths, self.exclude_local_paths)
 
 
 class FiltersConfig(BaseModel):
@@ -87,6 +129,7 @@ class FiltersConfig(BaseModel):
 
 class OutputConfig(BaseModel):
     base_dir: str = Field(default="~/standard_coder_outputs")
+    repos_dir: str = Field(default="repos")
     raw_dir: str = Field(default="raw")
     features_dir: str = Field(default="features")
     labels_dir: str = Field(default="labels")
@@ -100,6 +143,7 @@ class OutputConfig(BaseModel):
         base = _expand(self.base_dir)
         return ResolvedOutputPaths(
             base_dir=base,
+            repos_dir=base / self.repos_dir,
             raw_dir=base / self.raw_dir,
             features_dir=base / self.features_dir,
             labels_dir=base / self.labels_dir,
@@ -109,6 +153,26 @@ class OutputConfig(BaseModel):
             logs_dir=base / self.logs_dir,
             checkpoints_dir=base / self.checkpoints_dir,
         )
+
+
+class GithubConfig(BaseModel):
+    enabled: bool = Field(default=False)
+    token_env_var: str = Field(default="GITHUB_TOKEN")
+    api_base_url: str = Field(default="https://api.github.com")
+    pulls_since: str | None = Field(default=None, description="ISO8601 cutoff for updated PRs.")
+    ingest_reviews: bool = Field(default=True)
+    ingest_check_runs: bool = Field(default=False)
+    clone_url_template: str = Field(default="https://github.com/{owner}/{repo}.git")
+
+
+class ZenhubConfig(BaseModel):
+    enabled: bool = Field(default=False)
+    token_env_var: str = Field(default="ZENHUB_TOKEN")
+    api_base_url: str = Field(default="https://api.zenhub.com")
+    mode: str = Field(default="milestones", description="milestones | iterations")
+    default_sprint_length_days: int = Field(default=10)
+    working_days: tuple[int, ...] = Field(default=(0, 1, 2, 3, 4))
+    milestone_title_prefix: str = Field(default="")
 
 
 class HmmConfig(BaseModel):
@@ -187,6 +251,18 @@ class ForecastingConfig(BaseModel):
         default="",
         description="Path to historical throughput samples JSON.",
     )
+    historical_sprints_path: str = Field(
+        default="",
+        description="Path to historical sprint outcomes (done effort + workdays).",
+    )
+    story_points_to_sch: float = Field(
+        default=2.0,
+        description="Fallback mapping from story points to SCH hours.",
+    )
+    story_points_cv: float = Field(
+        default=0.5,
+        description="Coefficient of variation for story-point fallback.",
+    )
 
 
 class PipelineConfig(BaseModel):
@@ -196,6 +272,8 @@ class PipelineConfig(BaseModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     checkpointing: CheckpointConfig = Field(default_factory=CheckpointConfig)
     forecasting: ForecastingConfig = Field(default_factory=ForecastingConfig)
+    github: GithubConfig = Field(default_factory=GithubConfig)
+    zenhub: ZenhubConfig = Field(default_factory=ZenhubConfig)
 
     @classmethod
     def load(cls, path: Path) -> "PipelineConfig":
@@ -205,6 +283,7 @@ class PipelineConfig(BaseModel):
 
 class ResolvedOutputPaths(BaseModel):
     base_dir: Path
+    repos_dir: Path
     raw_dir: Path
     features_dir: Path
     labels_dir: Path
@@ -220,6 +299,7 @@ class ResolvedOutputPaths(BaseModel):
     def ensure_dirs(self) -> None:
         for p in (
             self.base_dir,
+            self.repos_dir,
             self.raw_dir,
             self.features_dir,
             self.labels_dir,
@@ -230,3 +310,11 @@ class ResolvedOutputPaths(BaseModel):
             self.checkpoints_dir,
         ):
             p.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def github_db_path(self) -> Path:
+        return self.raw_dir / "github.sqlite"
+
+    @property
+    def zenhub_db_path(self) -> Path:
+        return self.raw_dir / "zenhub.sqlite"

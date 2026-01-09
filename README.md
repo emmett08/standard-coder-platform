@@ -58,6 +58,12 @@ Run a toy end-to-end demo (simulated commits + training + forecast):
 standard-coder demo
 ```
 
+Run the full pipeline with local repos:
+
+```bash
+standard-coder pipeline --config pipeline_config.toml --stages mine,train_sch,forecast
+```
+
 ## CLI
 
 ```bash

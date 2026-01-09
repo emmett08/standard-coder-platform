@@ -5,12 +5,21 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Iterable, Sequence
 
 import numpy as np
 import torch
 
+from standard_coder.adapters.git.git_ops import GitRepoSpec, clone_or_fetch_repo
+from standard_coder.adapters.github.github_client import GitHubClient
+from standard_coder.adapters.github.github_ingest import ingest_pull_requests
+from standard_coder.adapters.zenhub.zenhub_client import ZenHubClient
+from standard_coder.adapters.zenhub.zenhub_ingest import (
+    ingest_current_sprints_from_milestones,
+    load_issue_estimates,
+)
 from standard_coder.common.logging_config import configure_logging
 from standard_coder.pipeline.checkpointing import RunCheckpoint
 from standard_coder.pipeline.config import PipelineConfig, ResolvedOutputPaths
@@ -26,7 +35,7 @@ from standard_coder.sch.pipelines.training import SchTrainingPipeline
 from standard_coder.sch.predictors.mdn import MdnEffortPredictor
 from standard_coder.sch.predictors.quantile import QuantileEffortPredictor
 from standard_coder.sch.predictors.multitask import HeadConfig, TorchMultiTaskEffortPredictor
-from standard_coder.pipeline.pr_loader import load_pull_requests
+from standard_coder.pipeline.pr_loader import load_pull_requests, load_pull_requests_from_github_db
 
 from standard_coder.sch.work_inference.hawkes import HawkesWorkInference
 from standard_coder.sch.work_inference.neural_hmm import NeuralHmmWorkInference
@@ -82,27 +91,141 @@ class PipelineRunner:
             else:
                 raise ValueError(f"Unknown stage: {stage}")
 
+    def _resolve_repo_specs(self) -> list[GitRepoSpec]:
+        repos_cfg = self.config.repos
+        source = str(repos_cfg.source or "local").lower().strip()
+
+        if source == "github":
+            include = list(repos_cfg.include_github_repos or [])
+            if not include:
+                raise ValueError("repos.include_github_repos is required when repos.source='github'")
+
+            exclude = list(repos_cfg.exclude_github_repos or [])
+            clone_tmpl = (self.config.github.clone_url_template or "").strip()
+            if not clone_tmpl:
+                clone_tmpl = "https://github.com/{owner}/{repo}.git"
+
+            mirror = bool(repos_cfg.mirror_clone)
+            specs: list[GitRepoSpec] = []
+            for repo_full in include:
+                if any(fnmatch(repo_full, pat) for pat in exclude):
+                    continue
+                if "/" not in repo_full:
+                    logger.warning("Skipping invalid GitHub repo: %s", repo_full)
+                    continue
+                owner, repo = repo_full.split("/", 1)
+                url = clone_tmpl.format(owner=owner, repo=repo)
+                safe = repo_full.replace("/", "__")
+                local = self.outputs.repos_dir / (f"{safe}.git" if mirror else safe)
+                specs.append(GitRepoSpec(name=repo_full, url=url, local_path=local))
+            return specs
+
+        include = repos_cfg.local_include_paths()
+        exclude = repos_cfg.local_exclude_paths()
+        repos = discover_repos(include, exclude)
+        return [GitRepoSpec(name=repo.name, url=str(repo), local_path=repo) for repo in repos]
+
+    def _sync_repos(self, repo_specs: list[GitRepoSpec]) -> None:
+        repos_cfg = self.config.repos
+        mirror = bool(repos_cfg.mirror_clone)
+        prune = bool(repos_cfg.git_fetch_prune)
+        for spec in repo_specs:
+            if Path(spec.url).exists():
+                continue
+            clone_or_fetch_repo(spec, mirror=mirror, prune=prune)
+
+    def _ingest_github(self, repo_specs: list[GitRepoSpec]) -> None:
+        github_cfg = self.config.github
+        if not github_cfg.enabled:
+            return
+
+        token = os.environ.get(github_cfg.token_env_var, "")
+        if not token:
+            raise RuntimeError(f"Missing GitHub token in env var: {github_cfg.token_env_var}")
+
+        client = GitHubClient(token=token, api_base_url=github_cfg.api_base_url)
+        repo_names = [spec.name for spec in repo_specs if "/" in spec.name]
+        if not repo_names:
+            repo_names = list(self.config.repos.include_github_repos or [])
+        if not repo_names:
+            raise RuntimeError("No GitHub repos configured for ingestion.")
+
+        ingest_pull_requests(
+            github=client,
+            repos=repo_names,
+            db_path=self.outputs.github_db_path,
+            pulls_since_iso=github_cfg.pulls_since,
+            ingest_reviews=github_cfg.ingest_reviews,
+            ingest_check_runs=github_cfg.ingest_check_runs,
+        )
+
+    def _ingest_zenhub(self, repo_specs: list[GitRepoSpec]):
+        zenhub_cfg = self.config.zenhub
+        if not zenhub_cfg.enabled:
+            return []
+
+        gh_token = os.environ.get(self.config.github.token_env_var, "")
+        if not gh_token:
+            raise RuntimeError(f"Missing GitHub token in env var: {self.config.github.token_env_var}")
+
+        zh_token = os.environ.get(zenhub_cfg.token_env_var, "")
+        if not zh_token:
+            raise RuntimeError(f"Missing ZenHub token in env var: {zenhub_cfg.token_env_var}")
+
+        gh = GitHubClient(token=gh_token, api_base_url=self.config.github.api_base_url)
+        zh = ZenHubClient(token=zh_token, api_base_url=zenhub_cfg.api_base_url)
+
+        repos = [spec.name for spec in repo_specs if "/" in spec.name]
+        if not repos:
+            repos = list(self.config.repos.include_github_repos or [])
+
+        repo_ids: dict[str, int] = {}
+        for repo_full in repos:
+            owner, name = repo_full.split("/", 1)
+            repo_ids[repo_full] = gh.get_repo_id(owner, name)
+
+        mode = str(zenhub_cfg.mode).lower()
+        if mode != "milestones":
+            logger.warning("ZenHub mode %s not implemented; falling back to milestones", mode)
+
+        return ingest_current_sprints_from_milestones(
+            github=gh,
+            zenhub=zh,
+            repos=repos,
+            github_repo_ids=repo_ids,
+            db_path=self.outputs.zenhub_db_path,
+            milestone_title_prefix=zenhub_cfg.milestone_title_prefix,
+            default_sprint_length_days=zenhub_cfg.default_sprint_length_days,
+        )
+
     def _stage_mine(self) -> None:
         stage = "mine"
         if self.checkpoint.is_stage_done(stage) and self.config.checkpointing.resume:
             self.ui.log("[green]Skipping mine (already done).[/green]")
             return
 
-        repos = discover_repos(self.config.repos.include_paths, self.config.repos.exclude_paths)
-        self.ui.log(f"Discovered {len(repos)} repositories")
+        repo_specs = self._resolve_repo_specs()
+        if str(self.config.repos.source or "local").lower().strip() == "github":
+            self._sync_repos(repo_specs)
+
+        self.ui.log(f"Discovered {len(repo_specs)} repositories")
 
         store = RawStore(self.outputs.raw_dir / "mined_commits.sqlite")
         conn = store.connect()
 
-        task = self.ui.progress.add_task("Mining commits", total=len(repos))
-        for repo in repos:
+        task = self.ui.progress.add_task("Mining commits", total=len(repo_specs))
+        for spec in repo_specs:
+            repo_label = spec.name if "/" in spec.name else str(spec.local_path)
             # repo-level filter
-            if not self.config.filters.repos.matches(str(repo)):
+            if not self.config.filters.repos.matches(repo_label):
                 self.ui.progress.advance(task)
                 continue
 
             try:
-                for mc in iter_mined_commits(repo, max_commits=self.config.repos.max_commits_per_repo):
+                for mc in iter_mined_commits(
+                    spec.local_path,
+                    max_commits=self.config.repos.max_commits_per_repo,
+                ):
                     if not self.config.filters.languages.matches(mc.language):
                         continue
                     if not self.config.filters.authors.matches(mc.author_id):
@@ -115,7 +238,7 @@ class PipelineRunner:
             self.ui.progress.advance(task)
 
         conn.close()
-        self.checkpoint.mark_stage_done(stage, meta={"repos": len(repos)})
+        self.checkpoint.mark_stage_done(stage, meta={"repos": len(repo_specs)})
         self.ui.log("[green]Mining complete.[/green]")
 
     def _stage_train_sch(self) -> None:
@@ -123,6 +246,10 @@ class PipelineRunner:
         if self.checkpoint.is_stage_done(stage) and self.config.checkpointing.resume:
             self.ui.log("[green]Skipping train_sch (already done).[/green]")
             return
+
+        repo_specs = self._resolve_repo_specs()
+        if self.config.github.enabled:
+            self._ingest_github(repo_specs)
 
         # Load mined commit metadata
         store = RawStore(self.outputs.raw_dir / "mined_commits.sqlite")
@@ -245,14 +372,28 @@ class PipelineRunner:
             if not self.config.training.multitask.enable:
                 raise RuntimeError("predictor_kind=multitask but [training.multitask].enable=false")
 
-            pr_path = Path(self.config.training.multitask.pull_requests_path).expanduser()
-            if not pr_path.exists():
+            pr_path_raw = self.config.training.multitask.pull_requests_path.strip()
+            pull_requests: list[PullRequest]
+            if pr_path_raw:
+                pr_path = Path(pr_path_raw).expanduser()
+                if not pr_path.exists():
+                    raise RuntimeError(
+                        "Multi-task training requires pull_requests_path to a JSON file "
+                        "(see examples/prs.example.json)."
+                    )
+                pull_requests = load_pull_requests(pr_path)
+                self.ui.log(f"Loaded {len(pull_requests)} PRs from {pr_path}")
+            elif self.config.github.enabled and self.outputs.github_db_path.exists():
+                pull_requests = load_pull_requests_from_github_db(self.outputs.github_db_path)
+                if not pull_requests:
+                    raise RuntimeError(
+                        "GitHub ingestion DB contains no PRs; check [github] settings or ingest again."
+                    )
+                self.ui.log(f"Loaded {len(pull_requests)} PRs from {self.outputs.github_db_path}")
+            else:
                 raise RuntimeError(
-                    "Multi-task training requires pull_requests_path to a JSON file "
-                    "(see examples/prs.example.json)."
+                    "Multi-task training requires pull_requests_path or enabled GitHub ingestion."
                 )
-
-            pull_requests = load_pull_requests(pr_path)
             ds_path = ds_dir / "multitask_train.npz"
 
             if ds_path.exists() and cr_cached is not None and self.config.checkpointing.resume:
@@ -627,6 +768,7 @@ class PipelineRunner:
         torch.save({"net": pred._net.state_dict(), "config": pred.__dict__}, model_path)
         meta_path.write_text(json.dumps({"model_version": pred.model_version, "unit": pred.unit}, indent=2))
         self.ui.log(f"Saved multi-task model to {model_path}")
+
     def _save_change_rep(self, change_rep) -> Path:
         """Persist the fitted change representation for downstream scoring."""
         import joblib
@@ -645,6 +787,7 @@ class PipelineRunner:
         import joblib
 
         return joblib.load(cr_path)
+
     def _stage_forecast(self) -> None:
         stage = "forecast"
         if not self.config.forecasting.enable:
@@ -655,8 +798,15 @@ class PipelineRunner:
             return
 
         from datetime import date, datetime
+        import math
 
-        from standard_coder.forecasting.priors.throughput import EmpiricalThroughputPrior
+        import scipy.stats as st
+
+        from standard_coder.forecasting.priors.throughput import (
+            EmpiricalThroughputPrior,
+            default_throughput_prior,
+            throughput_prior_from_history,
+        )
         from standard_coder.forecasting.services.forecasting_service import ForecastingService
         from standard_coder.integration.event_bus import InMemoryEventBus
         from standard_coder.integration.events import (
@@ -668,95 +818,214 @@ class PipelineRunner:
             WorkItemEffortEstimated,
         )
 
-        bus = InMemoryEventBus()
+        def _lognormal_quantiles(mean: float, cv: float) -> dict[float, float]:
+            mean = max(1e-6, float(mean))
+            cv = max(1e-6, float(cv))
+            sigma2 = math.log(cv * cv + 1.0)
+            sigma = math.sqrt(sigma2)
+            mu = math.log(mean) - sigma2 / 2.0
+            return {
+                0.5: math.exp(mu + sigma * st.norm.ppf(0.5)),
+                0.8: math.exp(mu + sigma * st.norm.ppf(0.8)),
+                0.9: math.exp(mu + sigma * st.norm.ppf(0.9)),
+            }
 
-        # Load sprint inputs file if provided; otherwise skip.
+        def _story_points_effort(points: float | None) -> dict[str, object]:
+            sp = float(points) if points is not None else 1.0
+            mean = max(1e-6, sp) * self.config.forecasting.story_points_to_sch
+            q = _lognormal_quantiles(mean, self.config.forecasting.story_points_cv)
+            return {"type": "quantiles", "quantiles": {str(k): float(v) for k, v in q.items()}}
+
+        def _load_throughput_prior() -> object:
+            hist_sprints = self.config.forecasting.historical_sprints_path.strip()
+            if hist_sprints:
+                p = Path(hist_sprints).expanduser()
+                if p.exists():
+                    return throughput_prior_from_history(p)
+
+            hist_path = Path(self.config.forecasting.historical_outcomes_path).expanduser()
+            if hist_path.exists():
+                try:
+                    hist = json.loads(hist_path.read_text())
+                    samples = tuple(float(x) for x in hist.get("throughput_samples_sch_per_day", []))
+                except Exception:
+                    samples = tuple()
+                if samples:
+                    return EmpiricalThroughputPrior(samples=samples)
+
+            return default_throughput_prior()
+
+        prior = _load_throughput_prior()
+
+        sprint_inputs = None
         sprint_path_raw = self.config.forecasting.sprint_inputs_path.strip()
-        if not sprint_path_raw:
-            self.ui.log("No sprint_inputs_path provided; skipping forecast.")
-            return
-        sprint_path = Path(sprint_path_raw).expanduser()
-        if not sprint_path.exists():
-            self.ui.log("No sprint_inputs_path provided; skipping forecast.")
-            return
+        if sprint_path_raw:
+            sprint_path = Path(sprint_path_raw).expanduser()
+            if sprint_path.exists():
+                sprint_inputs = json.loads(sprint_path.read_text())
+            else:
+                self.ui.log(f"sprint_inputs_path not found: {sprint_path}")
 
-        sprint_inputs = json.loads(sprint_path.read_text())
-
-        hist_path = Path(self.config.forecasting.historical_outcomes_path).expanduser()
-        if hist_path.exists():
-            hist = json.loads(hist_path.read_text())
-            samples = tuple(float(x) for x in hist.get("throughput_samples_sch_per_day", []))
-        else:
-            samples = tuple()
-
-        if not samples:
-            # Fallback prior: 1..10 SCH/day
-            samples = tuple(float(i) for i in range(1, 11))
-
-        prior = EmpiricalThroughputPrior(samples=samples)
-        forecasting = ForecastingService(bus=bus, throughput_prior=prior, n_sims=self.config.forecasting.n_sims, rng_seed=self.config.forecasting.rng_seed)
-
-        # Publish sprint configuration and state.
-        sc = sprint_inputs["sprint"]
-        bus.publish(
-            SprintConfigured(
-                occurred_at=datetime.utcnow(),
-                sprint_id=sc["sprint_id"],
-                start_date=date.fromisoformat(sc["start_date"]),
-                length_days=int(sc["length_days"]),
-                working_days=tuple(sc["working_days"]),
-            )
-        )
-
-        for cap in sprint_inputs.get("capacity", []):
-            bus.publish(
-                AvailabilityChanged(
-                    occurred_at=datetime.utcnow(),
-                    person_id=str(cap.get("person_id", "team")),
-                    day=date.fromisoformat(cap["day"]),
-                    delta_available_sch=float(cap["delta_available_sch"]),
-                )
+        if sprint_inputs:
+            bus = InMemoryEventBus()
+            forecasting = ForecastingService(
+                bus=bus,
+                throughput_prior=prior,
+                n_sims=self.config.forecasting.n_sims,
+                rng_seed=self.config.forecasting.rng_seed,
             )
 
-        for item in sprint_inputs.get("work_items", []):
-            wid = str(item["work_item_id"])
+            # Publish sprint configuration and state.
+            sc = sprint_inputs["sprint"]
             bus.publish(
-                WorkItemAddedToSprint(
+                SprintConfigured(
                     occurred_at=datetime.utcnow(),
                     sprint_id=sc["sprint_id"],
-                    work_item_id=wid,
+                    start_date=date.fromisoformat(sc["start_date"]),
+                    length_days=int(sc["length_days"]),
+                    working_days=tuple(sc["working_days"]),
                 )
             )
-            bus.publish(
-                WorkItemStatusChanged(
-                    occurred_at=datetime.utcnow(),
-                    work_item_id=wid,
-                    old_status="todo",
-                    new_status=str(item.get("status", "todo")),
-                )
-            )
-            if "scope_factor" in item:
+
+            for cap in sprint_inputs.get("capacity", []):
                 bus.publish(
-                    ScopeChanged(
+                    AvailabilityChanged(
                         occurred_at=datetime.utcnow(),
-                        work_item_id=wid,
-                        scope_factor=float(item["scope_factor"]),
+                        person_id=str(cap.get("person_id", "team")),
+                        day=date.fromisoformat(cap["day"]),
+                        delta_available_sch=float(cap["delta_available_sch"]),
                     )
                 )
-            # Effort estimates are expected to be in event payload format.
-            if "effort" in item:
+
+            for item in sprint_inputs.get("work_items", []):
+                wid = str(item["work_item_id"])
+                bus.publish(
+                    WorkItemAddedToSprint(
+                        occurred_at=datetime.utcnow(),
+                        sprint_id=sc["sprint_id"],
+                        work_item_id=wid,
+                    )
+                )
+                bus.publish(
+                    WorkItemStatusChanged(
+                        occurred_at=datetime.utcnow(),
+                        work_item_id=wid,
+                        old_status="todo",
+                        new_status=str(item.get("status", "todo")),
+                    )
+                )
+                if "scope_factor" in item:
+                    bus.publish(
+                        ScopeChanged(
+                            occurred_at=datetime.utcnow(),
+                            work_item_id=wid,
+                            scope_factor=float(item["scope_factor"]),
+                        )
+                    )
+                # Effort estimates are expected to be in event payload format.
+                if "effort" in item:
+                    bus.publish(
+                        WorkItemEffortEstimated(
+                            occurred_at=datetime.utcnow(),
+                            work_item_id=wid,
+                            effort=item["effort"],
+                            model_version=str(item.get("model_version", "external")),
+                        )
+                    )
+                elif "story_points" in item:
+                    bus.publish(
+                        WorkItemEffortEstimated(
+                            occurred_at=datetime.utcnow(),
+                            work_item_id=wid,
+                            effort=_story_points_effort(item.get("story_points")),
+                            model_version="story_points",
+                        )
+                    )
+
+            results = forecasting.compute_forecast(sc["sprint_id"])
+            out = next(iter(results.values()))
+            out_path = self.outputs.forecasts_dir / f"{sc['sprint_id']}_forecast.json"
+            out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
+            self.checkpoint.mark_stage_done(stage, meta={"sprint_id": sc["sprint_id"]})
+            self.ui.log(f"[green]Forecast written to {out_path}[/green]")
+            return
+
+        if not self.config.zenhub.enabled:
+            self.ui.log("No sprint_inputs_path provided and ZenHub disabled; skipping forecast.")
+            return
+
+        repo_specs = self._resolve_repo_specs()
+        sprints = self._ingest_zenhub(repo_specs)
+        if not sprints:
+            self.ui.log("No sprint_inputs_path provided and no ZenHub sprints; skipping forecast.")
+            return
+
+        working_days = tuple(self.config.zenhub.working_days)
+        sp_cv = self.config.forecasting.story_points_cv
+        sp_to_sch = self.config.forecasting.story_points_to_sch
+
+        for sprint in sprints:
+            bus = InMemoryEventBus()
+            forecasting = ForecastingService(
+                bus=bus,
+                throughput_prior=prior,
+                n_sims=self.config.forecasting.n_sims,
+                rng_seed=self.config.forecasting.rng_seed,
+            )
+
+            length_days = (sprint.end_date.toordinal() - sprint.start_date.toordinal()) + 1
+            sprint_id = sprint.sprint_id
+
+            bus.publish(
+                SprintConfigured(
+                    occurred_at=datetime.utcnow(),
+                    sprint_id=sprint_id,
+                    start_date=sprint.start_date,
+                    length_days=int(length_days),
+                    working_days=tuple(working_days),
+                )
+            )
+
+            estimates = load_issue_estimates(
+                self.outputs.zenhub_db_path,
+                sprint.repo,
+                sprint.issue_numbers,
+            )
+
+            for issue_number in sprint.issue_numbers:
+                work_item_id = f"{sprint.repo}#{issue_number}"
+                bus.publish(
+                    WorkItemAddedToSprint(
+                        occurred_at=datetime.utcnow(),
+                        sprint_id=sprint_id,
+                        work_item_id=work_item_id,
+                    )
+                )
+                sp = estimates.get(issue_number)
+                mean = (float(sp) if sp is not None else 1.0) * sp_to_sch
+                effort = _lognormal_quantiles(mean, sp_cv)
                 bus.publish(
                     WorkItemEffortEstimated(
                         occurred_at=datetime.utcnow(),
-                        work_item_id=wid,
-                        effort=item["effort"],
-                        model_version=str(item.get("model_version", "external")),
+                        work_item_id=work_item_id,
+                        effort={"type": "quantiles", "quantiles": {str(k): float(v) for k, v in effort.items()}},
+                        model_version="story_points",
                     )
                 )
 
-        results = forecasting.compute_forecast(sc["sprint_id"])
-        out = next(iter(results.values()))
-        out_path = self.outputs.forecasts_dir / f"{sc['sprint_id']}_forecast.json"
-        out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
-        self.checkpoint.mark_stage_done(stage, meta={"sprint_id": sc["sprint_id"]})
-        self.ui.log(f"[green]Forecast written to {out_path}[/green]")
+            results = forecasting.compute_forecast(sprint_id)
+            out = next(iter(results.values()))
+            out_path = self.outputs.forecasts_dir / f"{_safe_name(sprint_id)}_forecast.json"
+            out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
+            self.ui.log(f"[green]Forecast written to {out_path}[/green]")
+
+        self.checkpoint.mark_stage_done(stage, meta={"sprints": len(sprints)})
+
+
+def _safe_name(text: str) -> str:
+    return (
+        text.replace("/", "__")
+        .replace("#", "_")
+        .replace(":", "_")
+        .replace(" ", "_")
+    )
