@@ -219,7 +219,10 @@ class PipelineRunner:
                 self.ui.progress.advance(wi_task)
                 continue
 
-            if hasattr(wi, "export_author_state"):
+            should_export = True
+            if hasattr(wi, "fitted_author_ids"):
+                should_export = author in wi.fitted_author_ids()  # type: ignore[attr-defined]
+            if hasattr(wi, "export_author_state") and should_export:
                 payload = wi.export_author_state(author)  # type: ignore[attr-defined]
                 out_file.write_text(json.dumps(payload))
             self.ui.progress.advance(wi_task)
@@ -668,7 +671,11 @@ class PipelineRunner:
         bus = InMemoryEventBus()
 
         # Load sprint inputs file if provided; otherwise skip.
-        sprint_path = Path(self.config.forecasting.sprint_inputs_path).expanduser()
+        sprint_path_raw = self.config.forecasting.sprint_inputs_path.strip()
+        if not sprint_path_raw:
+            self.ui.log("No sprint_inputs_path provided; skipping forecast.")
+            return
+        sprint_path = Path(sprint_path_raw).expanduser()
         if not sprint_path.exists():
             self.ui.log("No sprint_inputs_path provided; skipping forecast.")
             return

@@ -9,11 +9,11 @@ exclude_paths = ["*/node_modules/*", "*/.venv/*", "*/vendor/*"]
 max_commits_per_repo = 20000
 
 [filters.authors]
-include = ["emmett08", "Emmett Miller", "emmett.miller7@outlook.com"]
+include = ["emmett08", "Emmett Miller", "emmett.miller7@outlook.com", "neuralsea-lab"]
 exclude = ["bot", "dependabot", "renovate", "github-actions"]
 
 [filters.repos]
-include = ["standard-coder-platform"]
+include = ["standard_coder_platform", "standard-coder-platform", "neuralsea-lab"]
 exclude = []
 
 [filters.languages]
@@ -42,7 +42,7 @@ step_minutes = 5
 epochs = 250
 lr = 0.01
 hidden_size = 16
-min_commits_per_author = 50
+min_commits_per_author = 1
 device = "mps"
 
 [training.change_rep]
@@ -70,7 +70,7 @@ device = "mps"
 
 [checkpointing]
 save_every_epochs = 1
-resume = true
+resume = false
 
 [forecasting]
 enable = true

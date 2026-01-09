@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import fnmatch
+import glob
 import gzip
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -27,7 +29,9 @@ def discover_repos(include_globs: list[str], exclude_globs: list[str]) -> list[P
     """Discover local git repositories from glob patterns."""
     candidates: list[Path] = []
     for g in include_globs:
-        for p in Path().expanduser().glob(g):
+        expanded = os.path.expanduser(g)
+        for match in glob.glob(expanded):
+            p = Path(match)
             if not p.exists():
                 continue
             if p.is_file():
@@ -36,8 +40,9 @@ def discover_repos(include_globs: list[str], exclude_globs: list[str]) -> list[P
                 candidates.append(p.resolve())
 
     out: list[Path] = []
+    expanded_excludes = [os.path.expanduser(ex) for ex in exclude_globs]
     for p in candidates:
-        excluded = any(fnmatch.fnmatch(str(p), ex) for ex in exclude_globs)
+        excluded = any(fnmatch.fnmatch(str(p), ex) for ex in expanded_excludes)
         if not excluded:
             out.append(p)
     # Stable order for reproducibility
