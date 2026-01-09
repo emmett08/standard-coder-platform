@@ -38,6 +38,7 @@ class BagOfTokensChangeRep(ChangeRepModel):
             lowercase=False,
             max_features=self.max_features,
             min_df=self.min_df,
+            token_pattern=None,
         )
         self.vectoriser.fit(texts)
 
