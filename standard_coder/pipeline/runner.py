@@ -754,8 +754,9 @@ class PipelineRunner:
                     )
                 )
 
-        out = forecasting.get_latest_forecast(sc["sprint_id"])
+        results = forecasting.compute_forecast(sc["sprint_id"])
+        out = next(iter(results.values()))
         out_path = self.outputs.forecasts_dir / f"{sc['sprint_id']}_forecast.json"
-        out_path.write_text(json.dumps(out, indent=2, default=str))
+        out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
         self.checkpoint.mark_stage_done(stage, meta={"sprint_id": sc["sprint_id"]})
         self.ui.log(f"[green]Forecast written to {out_path}[/green]")

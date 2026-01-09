@@ -76,8 +76,8 @@ resume = false
 enable = true
 n_sims = 5000
 rng_seed = 123
-sprint_inputs_path = ""
-historical_outcomes_path = ""
+sprint_inputs_path = "examples/forecasting/sprint_inputs.example.json"
+historical_outcomes_path = "examples/forecasting/historical_outcomes.example.json"
 
 [training.multitask]
 enable = false
