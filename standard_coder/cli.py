@@ -4,6 +4,7 @@ import json
 import logging
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Optional
 
 import typer
