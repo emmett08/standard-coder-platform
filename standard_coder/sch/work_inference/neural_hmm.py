@@ -16,6 +16,17 @@ from standard_coder.sch.interfaces import WorkInferenceModel
 logger = logging.getLogger(__name__)
 
 
+def _select_device(device: str | None) -> torch.device:
+    """Prefer Apple Silicon MPS when available, else CUDA, else CPU."""
+    if device is not None:
+        return torch.device(device)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 class _TransitionNet(nn.Module):
     def __init__(self, hidden_size: int = 16) -> None:
         super().__init__()
@@ -99,7 +110,7 @@ class NeuralHmmWorkInference(WorkInferenceModel):
         self.hidden_size = int(hidden_size)
         self.min_commits = int(min_commits)
         self.model_version = model_version
-        self._device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self._device = _select_device(device)
         self._fitted: dict[str, _FittedHmm] = {}
 
     def fit(self, commit_times_by_author: dict[str, Sequence[int]]) -> None:
@@ -126,6 +137,57 @@ class NeuralHmmWorkInference(WorkInferenceModel):
 
             fitted = self._fit_single_author(base, y)
             self._fitted[author_id] = fitted
+
+    def fitted_author_ids(self) -> set[str]:
+        return set(self._fitted.keys())
+
+    def export_author_state(self, author_id: str) -> dict[str, object]:
+        """Export a fitted author's state for checkpointing."""
+        fitted = self._fitted[author_id]
+        return {
+            "base_minute": int(fitted.base_minute),
+            "step_minutes": int(fitted.step_minutes),
+            "coding_prob": fitted.coding_prob.tolist(),
+            "model_version": fitted.model_version,
+        }
+
+    def import_author_state(self, author_id: str, payload: dict[str, object]) -> None:
+        """Import a fitted author's state from a checkpoint."""
+        base_minute = int(payload["base_minute"])
+        step_minutes = int(payload["step_minutes"])
+        coding_prob = np.asarray(payload["coding_prob"], dtype=np.float32)
+        model_version = str(payload.get("model_version", self.model_version))
+        self._fitted[author_id] = _FittedHmm(
+            base_minute=base_minute,
+            step_minutes=step_minutes,
+            coding_prob=coding_prob,
+            model_version=model_version,
+        )
+
+    def fit_single_author(self, author_id: str, times: Sequence[int]) -> None:
+        """Fit a single author (useful for incremental checkpointing)."""
+        times_sorted = sorted(set(int(t) for t in times))
+        if len(times_sorted) < self.min_commits:
+            logger.info(
+                "Skipping author %s (only %d commits)",
+                author_id,
+                len(times_sorted),
+            )
+            return
+
+        base = times_sorted[0]
+        last = times_sorted[-1]
+        total_minutes = max(1, last - base)
+        steps = int(math.ceil(total_minutes / self.step_minutes)) + 1
+
+        y = np.zeros(steps, dtype=np.float32)
+        for t in times_sorted:
+            idx = int((t - base) / self.step_minutes)
+            if 0 <= idx < steps:
+                y[idx] = 1.0
+
+        fitted = self._fit_single_author(base, y)
+        self._fitted[author_id] = fitted
 
     def _fit_single_author(self, base_minute: int, y: np.ndarray) -> _FittedHmm:
         device = self._device

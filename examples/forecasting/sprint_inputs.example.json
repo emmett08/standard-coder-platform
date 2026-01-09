@@ -1,0 +1,56 @@
+{
+  "sprint": {
+    "sprint_id": "SPRINT-1",
+    "start_date": "2026-01-05",
+    "length_days": 14,
+    "working_days": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ]
+  },
+  "capacity": [
+    {
+      "person_id": "team",
+      "day": "2026-01-05",
+      "delta_available_sch": 30.0
+    },
+    {
+      "person_id": "team",
+      "day": "2026-01-06",
+      "delta_available_sch": 30.0
+    }
+  ],
+  "work_items": [
+    {
+      "work_item_id": "TICKET-1",
+      "status": "todo",
+      "scope_factor": 1.0,
+      "effort": {
+        "type": "quantiles",
+        "quantiles": {
+          "0.5": 0.2,
+          "0.8": 0.4,
+          "0.9": 0.6
+        }
+      },
+      "model_version": "mdn_v1"
+    },
+    {
+      "work_item_id": "TICKET-2",
+      "status": "done",
+      "scope_factor": 1.0,
+      "effort": {
+        "type": "quantiles",
+        "quantiles": {
+          "0.5": 0.1,
+          "0.8": 0.2,
+          "0.9": 0.3
+        }
+      },
+      "model_version": "mdn_v1"
+    }
+  ]
+}

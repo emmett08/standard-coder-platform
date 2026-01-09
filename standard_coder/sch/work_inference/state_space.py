@@ -76,6 +76,26 @@ class VariationalStateSpaceWorkInference(WorkInferenceModel):
                 model_version=self.model_version,
             )
 
+    def fitted_author_ids(self) -> set[str]:
+        return set(self._fitted.keys())
+
+    def export_author_state(self, author_id: str) -> dict[str, object]:
+        fitted = self._fitted[author_id]
+        return {
+            "base_minute": int(fitted.base_minute),
+            "step_minutes": int(fitted.step_minutes),
+            "coding_prob": fitted.coding_prob.tolist(),
+            "model_version": fitted.model_version,
+        }
+
+    def import_author_state(self, author_id: str, payload: dict[str, object]) -> None:
+        self._fitted[author_id] = _FittedStateSpace(
+            base_minute=int(payload["base_minute"]),
+            step_minutes=int(payload["step_minutes"]),
+            coding_prob=np.asarray(payload["coding_prob"], dtype=np.float32),
+            model_version=str(payload.get("model_version", self.model_version)),
+        )
+
     def _infer_prob_curve(self, y: np.ndarray) -> np.ndarray:
         dt = float(self.step_minutes)
         steps = int(y.shape[0])

@@ -1,0 +1,20 @@
+[
+  {
+    "pr_id": "PR-123",
+    "repo": "my-repo",
+    "author_id": "dev@example.com",
+    "opened_at": "2026-01-01T09:00:00+00:00",
+    "merged_at": "2026-01-02T15:00:00+00:00",
+    "commits": [
+      "<commit_sha1>",
+      "<commit_sha2>"
+    ],
+    "review_rounds": 2,
+    "review_comments": 10,
+    "ci_runs": 3,
+    "ci_failures": 1,
+    "metadata": {
+      "team": "core"
+    }
+  }
+]

@@ -18,6 +18,17 @@ from standard_coder.sch.interfaces import MultiTaskEffortPredictor
 logger = logging.getLogger(__name__)
 
 
+def _select_device(device: str | None) -> torch.device:
+    """Prefer Apple Silicon MPS when available, else CUDA, else CPU."""
+    if device is not None:
+        return torch.device(device)
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
 HeadKind = Literal["mdn", "quantile"]
 
 
@@ -166,7 +177,7 @@ class TorchMultiTaskEffortPredictor(MultiTaskEffortPredictor):
         y1 = torch.tensor(y_coding.reshape(-1, 1), dtype=torch.float32)
         y2 = torch.tensor(y_delivery.reshape(-1, 1), dtype=torch.float32)
 
-        device = torch.device(self.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        device = _select_device(self.device)
         self._net = _MultiTaskNet(
             in_dim=x.shape[1],
             trunk_sizes=self.trunk_sizes,

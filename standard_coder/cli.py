@@ -9,6 +9,10 @@ from typing import Optional
 import typer
 
 from standard_coder.common.logging_config import configure_logging
+from standard_coder.pipeline.config import PipelineConfig
+from standard_coder.pipeline.progress_ui import progress_ui
+from standard_coder.pipeline.runner import PipelineRunner
+
 from standard_coder.forecasting.priors.throughput import EmpiricalThroughputPrior
 from standard_coder.forecasting.scenarios.scenarios import ScopeGrowthScenario, TimeOffScenario
 from standard_coder.forecasting.services.forecasting_service import ForecastingService
@@ -233,3 +237,42 @@ def demo(
 
     typer.echo("\nJSON output:")
     typer.echo(json.dumps({k: asdict(v) for k, v in results.items()}, indent=2, default=str))
+
+
+@app.command()
+def init_config(
+    path: str = typer.Argument(
+        "pipeline_config.toml",
+        help="Where to write the pipeline configuration TOML",
+    ),
+) -> None:
+    """Write an example pipeline_config.toml."""
+    from pathlib import Path
+
+    project_root = Path(__file__).resolve().parents[1]
+    template = project_root / "pipeline_config.example.toml"
+    if not template.exists():
+        raise RuntimeError(f"Missing template file: {template}")
+
+    out = Path(path).expanduser()
+    if out.exists():
+        raise typer.BadParameter(f"Refusing to overwrite existing file: {out}")
+
+    out.write_text(template.read_text())
+    typer.echo(f"Wrote {out} (edit it, then run: standard-coder pipeline --config {out})")
+
+
+@app.command()
+def pipeline(
+    config: str = typer.Option("pipeline_config.toml", help="Path to pipeline_config.toml"),
+    stages: str = typer.Option(
+        "mine,train_sch,forecast",
+        help="Comma-separated stages: mine,train_sch,forecast",
+    ),
+) -> None:
+    """Run the resumable training pipeline with checkpoints and progress UI."""
+    config_path = Path(config).expanduser()
+    stage_list = [s.strip() for s in stages.split(",") if s.strip()]
+    with progress_ui() as ui:
+        runner = PipelineRunner.from_config_path(config_path, ui=ui)
+        runner.run(stage_list)

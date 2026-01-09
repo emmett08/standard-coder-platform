@@ -1,0 +1,121 @@
+# Standard Coder Platform - Resumable Pipeline Configuration
+#
+# Optimised defaults for Apple Silicon Macs (M-series): prefers torch MPS.
+#
+# Run:
+#   cp pipeline_config.example.toml pipeline_config.toml
+#   standard-coder pipeline --config pipeline_config.toml
+#
+# Resume after interruption:
+#   standard-coder pipeline --config pipeline_config.toml
+
+[repos]
+# Local repository discovery via glob patterns.
+# Examples:
+#   include_paths = ["~/code/*", "~/work/*"]
+#   include_paths = ["/Volumes/Work/Repos/*"]
+include_paths = ["~/code/*"]
+exclude_paths = ["*/node_modules/*", "*/.venv/*", "*/vendor/*"]
+max_commits_per_repo = 20000
+
+[filters.authors]
+# Substring match (case-insensitive) by default.
+# Use regex with prefix: re:<pattern>
+include = []
+exclude = ["bot", "dependabot", "renovate", "github-actions"]
+
+[filters.repos]
+include = []
+exclude = []
+
+[filters.languages]
+# Python included by default.
+include = ["python"]
+exclude = ["unknown"]
+
+[outputs]
+# Base output folder; created automatically.
+base_dir = "~/standard_coder_outputs"
+
+# Subdirectories; created automatically.
+raw_dir = "raw"
+features_dir = "features"
+labels_dir = "labels"
+models_dir = "models"
+forecasts_dir = "forecasts"
+reports_dir = "reports"
+logs_dir = "logs"
+checkpoints_dir = "checkpoints"
+
+[training]
+# Which predictor to train: "mdn" or "quantile".
+# (Multi-task is supported in the platform, but this pipeline trains coding SCH by default.)
+predictor_kind = "mdn"
+
+# Label sampling per commit interval (paper uses large sampling; start smaller for speed).
+label_samples_per_commit = 50
+rng_seed = 123
+
+[training.hmm]
+# Work inference model: "hmm" (paper-like baseline) | "hawkes" | "state_space"
+kind = "hmm"
+step_minutes = 5
+epochs = 250
+lr = 0.01
+hidden_size = 16
+min_commits_per_author = 50
+
+# Preferred compute device. Use "mps" on Apple Silicon.
+# If omitted, the runner auto-selects: mps -> cuda -> cpu.
+device = "mps"
+
+[training.change_rep]
+# Upgrade A (AST + graph features) for Python.
+use_upgrade_a = true
+tokens_max_features = 512
+tokens_min_df = 2
+
+[training.mdn]
+n_components = 10
+hidden_sizes = [128, 64, 64]
+epochs = 60
+lr = 0.001
+batch_size = 512
+truncate_low = 0.0
+truncate_high = 1.0
+device = "mps"
+
+[training.quantile]
+quantiles = [0.5, 0.8, 0.9]
+hidden_sizes = [128, 64, 64]
+epochs = 60
+lr = 0.001
+batch_size = 512
+device = "mps"
+
+[checkpointing]
+# Save training checkpoints every N epochs.
+save_every_epochs = 1
+resume = true
+
+[forecasting]
+# Pluggable forecasting domain. If you provide sprint inputs and throughput history,
+# the pipeline will emit completion probabilities and distributions.
+enable = true
+n_sims = 5000
+rng_seed = 123
+
+# JSON input files (optional). If sprint_inputs_path is empty or missing, forecast is skipped.
+sprint_inputs_path = ""
+historical_outcomes_path = ""
+
+
+[training.multitask]
+# Upgrade C: total effort via multi-task outputs (coding + delivery).
+# Provide a PR metadata JSON file (see examples/prs.example.json).
+enable = false
+pull_requests_path = ""
+epochs = 60
+lr = 0.001
+batch_size = 256
+device = "mps"
