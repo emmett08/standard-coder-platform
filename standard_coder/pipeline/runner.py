@@ -43,6 +43,38 @@ from standard_coder.sch.work_inference.state_space import VariationalStateSpaceW
 
 logger = logging.getLogger(__name__)
 
+def _stable_fingerprint(payload: object) -> str:
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+def _fit_hmm_author_payload(
+    author_id: str,
+    times: list[int],
+    *,
+    step_minutes: int,
+    epochs: int,
+    lr: float,
+    hidden_size: int,
+    min_commits: int,
+    device: str,
+) -> dict[str, object] | None:
+    """Fit a single HMM author in an isolated process.
+
+    Kept module-level so it can be pickled by ProcessPoolExecutor.
+    """
+    wi = NeuralHmmWorkInference(
+        step_minutes=step_minutes,
+        epochs=epochs,
+        lr=lr,
+        hidden_size=hidden_size,
+        min_commits=min_commits,
+        device=device,
+    )
+    wi.fit_single_author(author_id, times)
+    if hasattr(wi, "fitted_author_ids") and author_id not in wi.fitted_author_ids():  # type: ignore[attr-defined]
+        return None
+    return wi.export_author_state(author_id)
+
 
 def _sha1(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -200,7 +232,13 @@ class PipelineRunner:
 
     def _stage_mine(self) -> None:
         stage = "mine"
-        if self.checkpoint.is_stage_done(stage) and self.config.checkpointing.resume:
+        fingerprint = _stable_fingerprint(
+            {
+                "repos": self.config.repos.model_dump(),
+                "filters": self.config.filters.model_dump(),
+            }
+        )
+        if self.checkpoint.is_stage_done(stage, fingerprint=fingerprint) and self.config.checkpointing.resume:
             self.ui.log("[green]Skipping mine (already done).[/green]")
             return
 
@@ -233,17 +271,23 @@ class PipelineRunner:
                     store.upsert_mined_commit(conn, mc)
                 conn.commit()
             except Exception as exc:
-                logger.exception("Failed mining repo %s: %s", repo, exc)
+                logger.exception("Failed mining repo %s: %s", repo_label, exc)
 
             self.ui.progress.advance(task)
 
         conn.close()
-        self.checkpoint.mark_stage_done(stage, meta={"repos": len(repo_specs)})
+        self.checkpoint.mark_stage_done(stage, meta={"repos": len(repo_specs)}, fingerprint=fingerprint)
         self.ui.log("[green]Mining complete.[/green]")
 
     def _stage_train_sch(self) -> None:
         stage = "train_sch"
-        if self.checkpoint.is_stage_done(stage) and self.config.checkpointing.resume:
+        fingerprint = _stable_fingerprint(
+            {
+                "filters": self.config.filters.model_dump(),
+                "training": self.config.training.model_dump(),
+            }
+        )
+        if self.checkpoint.is_stage_done(stage, fingerprint=fingerprint) and self.config.checkpointing.resume:
             self.ui.log("[green]Skipping train_sch (already done).[/green]")
             return
 
@@ -320,39 +364,103 @@ class PipelineRunner:
         if mapping_path.exists() and self.config.checkpointing.resume:
             author_map = json.loads(mapping_path.read_text())
 
-        fitted_before = set(author_map.keys())
         authors = sorted(times_by_author.keys())
         wi_task = self.ui.progress.add_task(f"Fitting work inference ({kind})", total=len(authors))
 
+        # Ensure stable keys in author_map (even if we skip/parallelize).
         for author in authors:
-            key = author_map.get(author) or _sha1(author)
-            author_map[author] = key
-            out_file = wi_dir / f"{key}.json"
-            if out_file.exists() and self.config.checkpointing.resume:
-                payload = json.loads(out_file.read_text())
-                if hasattr(wi, "import_author_state"):
+            author_map.setdefault(author, _sha1(author))
+
+        # Import cached authors first so downstream dataset building can proceed.
+        if self.config.checkpointing.resume and hasattr(wi, "import_author_state"):
+            for author in authors:
+                out_file = wi_dir / f"{author_map[author]}.json"
+                if not out_file.exists():
+                    continue
+                try:
+                    payload = json.loads(out_file.read_text())
                     wi.import_author_state(author, payload)  # type: ignore[attr-defined]
-                self.ui.progress.advance(wi_task)
-                continue
+                except Exception:
+                    logger.debug("Failed to import cached state for author %s", author)
 
-            # Fit one author at a time for checkpointing.
-            try:
-                if hasattr(wi, "fit_single_author"):
-                    wi.fit_single_author(author, times_by_author[author])  # type: ignore[attr-defined]
-                else:
-                    wi.fit({author: times_by_author[author]})
-            except Exception as exc:
-                logger.debug("Work inference failed for author %s: %s", author, exc)
-                self.ui.progress.advance(wi_task)
-                continue
+        # Optional: parallelize author fitting (CPU only).
+        n_workers = max(1, int(getattr(hmm_cfg, "parallel_authors", 1)))
+        device_str = _prefer_mps(hmm_cfg.device) or "cpu"
+        if kind == "hmm" and n_workers > 1 and device_str != "cpu":
+            self.ui.log(
+                f"[yellow]training.hmm.parallel_authors={n_workers} requested but disabled on device={device_str}; "
+                "set training.hmm.device='cpu' to enable CPU parallel fitting.[/yellow]"
+            )
+            n_workers = 1
 
-            should_export = True
-            if hasattr(wi, "fitted_author_ids"):
-                should_export = author in wi.fitted_author_ids()  # type: ignore[attr-defined]
-            if hasattr(wi, "export_author_state") and should_export:
-                payload = wi.export_author_state(author)  # type: ignore[attr-defined]
-                out_file.write_text(json.dumps(payload))
-            self.ui.progress.advance(wi_task)
+        if kind == "hmm" and n_workers > 1:
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+
+            to_fit: list[str] = []
+            for author in authors:
+                out_file = wi_dir / f"{author_map[author]}.json"
+                if out_file.exists() and self.config.checkpointing.resume:
+                    self.ui.progress.advance(wi_task)
+                    continue
+                to_fit.append(author)
+
+            with ProcessPoolExecutor(max_workers=n_workers) as ex:
+                futs = {
+                    ex.submit(
+                        _fit_hmm_author_payload,
+                        author,
+                        list(times_by_author[author]),
+                        step_minutes=hmm_cfg.step_minutes,
+                        epochs=hmm_cfg.epochs,
+                        lr=hmm_cfg.lr,
+                        hidden_size=hmm_cfg.hidden_size,
+                        min_commits=hmm_cfg.min_commits_per_author,
+                        device=device_str,
+                    ): author
+                    for author in to_fit
+                }
+
+                for fut in as_completed(futs):
+                    author = futs[fut]
+                    try:
+                        payload = fut.result()
+                    except Exception as exc:
+                        logger.debug("Work inference failed for author %s: %s", author, exc)
+                        self.ui.progress.advance(wi_task)
+                        continue
+
+                    if payload is not None:
+                        out_file = wi_dir / f"{author_map[author]}.json"
+                        out_file.write_text(json.dumps(payload))
+                        if hasattr(wi, "import_author_state"):
+                            wi.import_author_state(author, payload)  # type: ignore[attr-defined]
+
+                    self.ui.progress.advance(wi_task)
+        else:
+            for author in authors:
+                out_file = wi_dir / f"{author_map[author]}.json"
+                if out_file.exists() and self.config.checkpointing.resume:
+                    self.ui.progress.advance(wi_task)
+                    continue
+
+                # Fit one author at a time for checkpointing.
+                try:
+                    if hasattr(wi, "fit_single_author"):
+                        wi.fit_single_author(author, times_by_author[author])  # type: ignore[attr-defined]
+                    else:
+                        wi.fit({author: times_by_author[author]})
+                except Exception as exc:
+                    logger.debug("Work inference failed for author %s: %s", author, exc)
+                    self.ui.progress.advance(wi_task)
+                    continue
+
+                should_export = True
+                if hasattr(wi, "fitted_author_ids"):
+                    should_export = author in wi.fitted_author_ids()  # type: ignore[attr-defined]
+                if hasattr(wi, "export_author_state") and should_export:
+                    payload = wi.export_author_state(author)  # type: ignore[attr-defined]
+                    out_file.write_text(json.dumps(payload))
+                self.ui.progress.advance(wi_task)
 
         mapping_path.write_text(json.dumps(author_map, indent=2, sort_keys=True))
         self.ui.log(f"Work inference fitted for {len(author_map)} authors (resume ok).")
@@ -406,13 +514,33 @@ class PipelineRunner:
             else:
                 from standard_coder.sch.pipelines.dataset_builder import SchDatasetBuilder
 
+                progress_tasks: dict[str, int] = {}
+
+                def on_progress(phase: str, completed: int, total: int) -> None:
+                    label = {
+                        "change_rep_fit": "Dataset: fitting change representation",
+                        "change_rep_transform": "Dataset: transforming commits",
+                        "label_pairs": "Dataset: sampling labels (commit pairs)",
+                    }.get(phase, f"Dataset: {phase}")
+
+                    task_id = progress_tasks.get(phase)
+                    if task_id is None:
+                        task_id = self.ui.progress.add_task(label, total=total)
+                        progress_tasks[phase] = task_id
+                    self.ui.progress.update(task_id, total=total, completed=completed)
+
                 builder = SchDatasetBuilder(
                     work_inference=wi,
                     change_rep=change_rep,
                     label_samples_per_commit=self.config.training.label_samples_per_commit,
                     rng_seed=self.config.training.rng_seed,
                 )
-                ds_built = builder.build_multitask_dataset(commits, pull_requests)
+                ds_built = builder.build_multitask_dataset(
+                    commits,
+                    pull_requests,
+                    fit_work_inference=False,
+                    on_progress=on_progress,
+                )
                 assert ds_built.y_delivery_hours is not None
                 x = ds_built.x
                 y_coding = ds_built.y_coding_hours
@@ -433,13 +561,28 @@ class PipelineRunner:
             else:
                 from standard_coder.sch.pipelines.dataset_builder import SchDatasetBuilder
 
+                progress_tasks: dict[str, int] = {}
+
+                def on_progress(phase: str, completed: int, total: int) -> None:
+                    label = {
+                        "change_rep_fit": "Dataset: fitting change representation",
+                        "change_rep_transform": "Dataset: transforming commits",
+                        "label_pairs": "Dataset: sampling labels (commit pairs)",
+                    }.get(phase, f"Dataset: {phase}")
+
+                    task_id = progress_tasks.get(phase)
+                    if task_id is None:
+                        task_id = self.ui.progress.add_task(label, total=total)
+                        progress_tasks[phase] = task_id
+                    self.ui.progress.update(task_id, total=total, completed=completed)
+
                 builder = SchDatasetBuilder(
                     work_inference=wi,
                     change_rep=change_rep,
                     label_samples_per_commit=self.config.training.label_samples_per_commit,
                     rng_seed=self.config.training.rng_seed,
                 )
-                ds_built = builder.build_coding_dataset(commits)
+                ds_built = builder.build_coding_dataset(commits, fit_work_inference=False, on_progress=on_progress)
                 x = ds_built.x
                 y = ds_built.y_coding_hours
                 np.savez_compressed(ds_path, x=x, y=y)
@@ -487,7 +630,11 @@ class PipelineRunner:
         else:
             raise ValueError("training.predictor_kind must be: mdn | quantile | multitask")
 
-        self.checkpoint.mark_stage_done(stage, meta={"commits": len(commits), "authors": len(authors)})
+        self.checkpoint.mark_stage_done(
+            stage,
+            meta={"commits": len(commits), "authors": len(authors)},
+            fingerprint=fingerprint,
+        )
         self.ui.log("[green]SCH training complete.[/green]")
 
     def _train_mdn_with_checkpoints(self, pred: MdnEffortPredictor, x: np.ndarray, y: np.ndarray) -> None:
@@ -507,7 +654,14 @@ class PipelineRunner:
         x_t = torch.tensor(x, dtype=torch.float32)
         y_t = torch.tensor(y.reshape(-1, 1), dtype=torch.float32)
         ds = TensorDataset(x_t, y_t)
-        dl = DataLoader(ds, batch_size=pred.batch_size, shuffle=True)
+        num_workers = int(getattr(self.config.training.mdn, "dataloader_num_workers", 0) or 0)
+        dl = DataLoader(
+            ds,
+            batch_size=pred.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=bool(num_workers > 0),
+        )
 
         net = _MdnNet(in_dim=x.shape[1], n_components=pred.n_components, hidden_sizes=pred.hidden_sizes).to(device)
         opt = torch.optim.Adam(net.parameters(), lr=pred.lr)
@@ -587,7 +741,14 @@ class PipelineRunner:
         x_t = torch.tensor(x, dtype=torch.float32)
         y_t = torch.tensor(y.reshape(-1, 1), dtype=torch.float32)
         ds = TensorDataset(x_t, y_t)
-        dl = DataLoader(ds, batch_size=pred.batch_size, shuffle=True)
+        num_workers = int(getattr(self.config.training.quantile, "dataloader_num_workers", 0) or 0)
+        dl = DataLoader(
+            ds,
+            batch_size=pred.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=bool(num_workers > 0),
+        )
 
         net = _QuantileNet(in_dim=x.shape[1], quantiles=pred.quantiles, hidden_sizes=pred.hidden_sizes).to(device)
         opt = torch.optim.Adam(net.parameters(), lr=pred.lr)
@@ -678,7 +839,14 @@ class PipelineRunner:
         y2 = torch.tensor(y_delivery.reshape(-1, 1), dtype=torch.float32)
 
         ds = TensorDataset(x_t, y1, y2)
-        dl = DataLoader(ds, batch_size=pred.batch_size, shuffle=True)
+        num_workers = int(getattr(self.config.training.multitask, "dataloader_num_workers", 0) or 0)
+        dl = DataLoader(
+            ds,
+            batch_size=pred.batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            persistent_workers=bool(num_workers > 0),
+        )
 
         net = _MultiTaskNet(
             in_dim=x.shape[1],
@@ -793,11 +961,18 @@ class PipelineRunner:
         if not self.config.forecasting.enable:
             self.ui.log("Forecasting disabled.")
             return
-        if self.checkpoint.is_stage_done(stage) and self.config.checkpointing.resume:
+        fingerprint = _stable_fingerprint(
+            {
+                "forecasting": self.config.forecasting.model_dump(),
+                "zenhub": self.config.zenhub.model_dump(),
+                "github": self.config.github.model_dump(),
+            }
+        )
+        if self.checkpoint.is_stage_done(stage, fingerprint=fingerprint) and self.config.checkpointing.resume:
             self.ui.log("[green]Skipping forecast (already done).[/green]")
             return
 
-        from datetime import date, datetime
+        from datetime import date, datetime, timezone
         import math
 
         import scipy.stats as st
@@ -879,7 +1054,7 @@ class PipelineRunner:
             sc = sprint_inputs["sprint"]
             bus.publish(
                 SprintConfigured(
-                    occurred_at=datetime.utcnow(),
+                    occurred_at=datetime.now(timezone.utc),
                     sprint_id=sc["sprint_id"],
                     start_date=date.fromisoformat(sc["start_date"]),
                     length_days=int(sc["length_days"]),
@@ -890,7 +1065,7 @@ class PipelineRunner:
             for cap in sprint_inputs.get("capacity", []):
                 bus.publish(
                     AvailabilityChanged(
-                        occurred_at=datetime.utcnow(),
+                        occurred_at=datetime.now(timezone.utc),
                         person_id=str(cap.get("person_id", "team")),
                         day=date.fromisoformat(cap["day"]),
                         delta_available_sch=float(cap["delta_available_sch"]),
@@ -901,14 +1076,14 @@ class PipelineRunner:
                 wid = str(item["work_item_id"])
                 bus.publish(
                     WorkItemAddedToSprint(
-                        occurred_at=datetime.utcnow(),
+                        occurred_at=datetime.now(timezone.utc),
                         sprint_id=sc["sprint_id"],
                         work_item_id=wid,
                     )
                 )
                 bus.publish(
                     WorkItemStatusChanged(
-                        occurred_at=datetime.utcnow(),
+                        occurred_at=datetime.now(timezone.utc),
                         work_item_id=wid,
                         old_status="todo",
                         new_status=str(item.get("status", "todo")),
@@ -917,7 +1092,7 @@ class PipelineRunner:
                 if "scope_factor" in item:
                     bus.publish(
                         ScopeChanged(
-                            occurred_at=datetime.utcnow(),
+                            occurred_at=datetime.now(timezone.utc),
                             work_item_id=wid,
                             scope_factor=float(item["scope_factor"]),
                         )
@@ -926,7 +1101,7 @@ class PipelineRunner:
                 if "effort" in item:
                     bus.publish(
                         WorkItemEffortEstimated(
-                            occurred_at=datetime.utcnow(),
+                            occurred_at=datetime.now(timezone.utc),
                             work_item_id=wid,
                             effort=item["effort"],
                             model_version=str(item.get("model_version", "external")),
@@ -935,7 +1110,7 @@ class PipelineRunner:
                 elif "story_points" in item:
                     bus.publish(
                         WorkItemEffortEstimated(
-                            occurred_at=datetime.utcnow(),
+                            occurred_at=datetime.now(timezone.utc),
                             work_item_id=wid,
                             effort=_story_points_effort(item.get("story_points")),
                             model_version="story_points",
@@ -946,7 +1121,7 @@ class PipelineRunner:
             out = next(iter(results.values()))
             out_path = self.outputs.forecasts_dir / f"{sc['sprint_id']}_forecast.json"
             out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
-            self.checkpoint.mark_stage_done(stage, meta={"sprint_id": sc["sprint_id"]})
+            self.checkpoint.mark_stage_done(stage, meta={"sprint_id": sc["sprint_id"]}, fingerprint=fingerprint)
             self.ui.log(f"[green]Forecast written to {out_path}[/green]")
             return
 
@@ -978,7 +1153,7 @@ class PipelineRunner:
 
             bus.publish(
                 SprintConfigured(
-                    occurred_at=datetime.utcnow(),
+                    occurred_at=datetime.now(timezone.utc),
                     sprint_id=sprint_id,
                     start_date=sprint.start_date,
                     length_days=int(length_days),
@@ -996,7 +1171,7 @@ class PipelineRunner:
                 work_item_id = f"{sprint.repo}#{issue_number}"
                 bus.publish(
                     WorkItemAddedToSprint(
-                        occurred_at=datetime.utcnow(),
+                        occurred_at=datetime.now(timezone.utc),
                         sprint_id=sprint_id,
                         work_item_id=work_item_id,
                     )
@@ -1006,7 +1181,7 @@ class PipelineRunner:
                 effort = _lognormal_quantiles(mean, sp_cv)
                 bus.publish(
                     WorkItemEffortEstimated(
-                        occurred_at=datetime.utcnow(),
+                        occurred_at=datetime.now(timezone.utc),
                         work_item_id=work_item_id,
                         effort={"type": "quantiles", "quantiles": {str(k): float(v) for k, v in effort.items()}},
                         model_version="story_points",
@@ -1019,7 +1194,7 @@ class PipelineRunner:
             out_path.write_text(json.dumps(out.__dict__, indent=2, default=str))
             self.ui.log(f"[green]Forecast written to {out_path}[/green]")
 
-        self.checkpoint.mark_stage_done(stage, meta={"sprints": len(sprints)})
+        self.checkpoint.mark_stage_done(stage, meta={"sprints": len(sprints)}, fingerprint=fingerprint)
 
 
 def _safe_name(text: str) -> str:

@@ -145,7 +145,7 @@ def demo(
 
     bus.publish(
         SprintConfigured(
-            occurred_at=datetime.utcnow(),
+            occurred_at=datetime.now(timezone.utc),
             sprint_id="SPRINT-1",
             start_date=sprint_start,
             length_days=14,
@@ -160,7 +160,7 @@ def demo(
             desired = float(team_size * 6.0)
             bus.publish(
                 AvailabilityChanged(
-                    occurred_at=datetime.utcnow(),
+                    occurred_at=datetime.now(timezone.utc),
                     person_id="team",
                     day=day,
                     delta_available_sch=desired - 8.0,
@@ -174,7 +174,7 @@ def demo(
     for wid in work_item_ids:
         bus.publish(
             WorkItemAddedToSprint(
-                occurred_at=datetime.utcnow(),
+                occurred_at=datetime.now(timezone.utc),
                 sprint_id="SPRINT-1",
                 work_item_id=wid,
             )
@@ -184,7 +184,7 @@ def demo(
     for wid in work_item_ids[:15]:
         bus.publish(
             WorkItemStatusChanged(
-                occurred_at=datetime.utcnow(),
+                occurred_at=datetime.now(timezone.utc),
                 work_item_id=wid,
                 old_status="todo",
                 new_status="done",
@@ -195,7 +195,7 @@ def demo(
     for wid in work_item_ids[15:20]:
         bus.publish(
             ScopeChanged(
-                occurred_at=datetime.utcnow(),
+                occurred_at=datetime.now(timezone.utc),
                 work_item_id=wid,
                 scope_factor=1.1,
             )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Sequence
 
 import numpy as np
@@ -83,7 +83,7 @@ class SchScoringService:
     ) -> None:
         if self.bus is None:
             return
-        occurred_at = occurred_at or datetime.utcnow()
+        occurred_at = occurred_at or datetime.now(timezone.utc)
         for wid, est in zip(work_item_ids, estimates, strict=True):
             payload = _serialise_effort(est)
             self.bus.publish(

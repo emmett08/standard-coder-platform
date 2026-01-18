@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from typing import Any, Mapping, Sequence
 
 import numpy as np
@@ -234,7 +234,7 @@ class ForecastingService:
 
             self.bus.publish(
                 SprintForecastComputed(
-                    occurred_at=datetime.utcnow(),
+                    occurred_at=datetime.now(timezone.utc),
                     sprint_id=sprint_id,
                     result=res.__dict__,
                     scenario_id=sc.scenario_id,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from datetime import datetime, timezone
 from typing import Any
 
 from fastapi import FastAPI
@@ -42,7 +43,7 @@ def create_app(
         c = Commit(
             commit_id=req.work_item_id,
             author_id=req.author_id,
-            authored_at=__import__("datetime").datetime.utcnow(),
+            authored_at=datetime.now(timezone.utc),
             language=req.language,
             changed_files=tuple(req.changed_files),
             diff_text=req.diff_text,

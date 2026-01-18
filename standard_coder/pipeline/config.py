@@ -183,6 +183,10 @@ class HmmConfig(BaseModel):
     hidden_size: int = Field(default=16)
     min_commits_per_author: int = Field(default=50)
     device: str | None = Field(default=None, description="mps recommended on Apple Silicon.")
+    parallel_authors: int = Field(
+        default=1,
+        description="Fit multiple authors in parallel (CPU-only; MPS/CUDA fall back to 1).",
+    )
 
 
 class ChangeRepConfig(BaseModel):
@@ -200,6 +204,10 @@ class MdnConfig(BaseModel):
     truncate_low: float | None = Field(default=0.0)
     truncate_high: float | None = Field(default=1.0)
     device: str | None = Field(default=None)
+    dataloader_num_workers: int = Field(
+        default=0,
+        description="PyTorch DataLoader num_workers (CPU prefetch).",
+    )
 
 
 class QuantileConfig(BaseModel):
@@ -209,6 +217,10 @@ class QuantileConfig(BaseModel):
     lr: float = Field(default=1e-3)
     batch_size: int = Field(default=512)
     device: str | None = Field(default=None)
+    dataloader_num_workers: int = Field(
+        default=0,
+        description="PyTorch DataLoader num_workers (CPU prefetch).",
+    )
 
 
 class MultiTaskConfig(BaseModel):
@@ -221,6 +233,10 @@ class MultiTaskConfig(BaseModel):
     lr: float = Field(default=1e-3)
     batch_size: int = Field(default=256)
     device: str | None = Field(default=None)
+    dataloader_num_workers: int = Field(
+        default=0,
+        description="PyTorch DataLoader num_workers (CPU prefetch).",
+    )
 
 
 class TrainingConfig(BaseModel):

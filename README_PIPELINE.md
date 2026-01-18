@@ -10,7 +10,7 @@ it provides a Rich progress UI and **checkpointing**, so if the process is inter
 ## 1) Quick start
 
 ```bash
-python -m venv .venv
+python3 -m venv .venv
 source .venv/bin/activate
 pip install -e ".[dev]"
 ```

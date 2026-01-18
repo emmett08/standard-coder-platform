@@ -45,15 +45,32 @@ class RunCheckpoint:
         self.state.setdefault("updated_at", time.time())
         _atomic_write_json(self.path, self.state)
 
-    def is_stage_done(self, stage: str) -> bool:
-        return bool(self.state.get("stages", {}).get(stage, {}).get("done", False))
+    def is_stage_done(self, stage: str, *, fingerprint: str | None = None) -> bool:
+        stage_state = self.state.get("stages", {}).get(stage, {})
+        done = bool(stage_state.get("done", False))
+        if not done:
+            return False
+        if fingerprint is None:
+            return True
+        meta = stage_state.get("meta", {}) or {}
+        return str(meta.get("fingerprint", "")) == str(fingerprint)
 
-    def mark_stage_done(self, stage: str, meta: dict[str, Any] | None = None) -> None:
+    def mark_stage_done(
+        self,
+        stage: str,
+        meta: dict[str, Any] | None = None,
+        *,
+        fingerprint: str | None = None,
+    ) -> None:
         stages = self.state.setdefault("stages", {})
         stages.setdefault(stage, {})
         stages[stage]["done"] = True
-        if meta:
-            stages[stage].setdefault("meta", {}).update(meta)
+        if meta or fingerprint is not None:
+            out_meta = stages[stage].setdefault("meta", {})
+            if meta:
+                out_meta.update(meta)
+            if fingerprint is not None:
+                out_meta["fingerprint"] = fingerprint
         self.save()
 
     def stage_meta(self, stage: str) -> dict[str, Any]:

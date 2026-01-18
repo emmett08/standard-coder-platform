@@ -81,6 +81,9 @@ epochs = 250
 lr = 0.01
 hidden_size = 16
 min_commits_per_author = 50
+# Fit per-author HMMs in parallel on CPU.
+# Note: for torch MPS/CUDA devices this falls back to 1 worker.
+parallel_authors = 1
 
 # Preferred compute device. Use "mps" on Apple Silicon.
 # If omitted, the runner auto-selects: mps -> cuda -> cpu.
@@ -101,6 +104,8 @@ batch_size = 512
 truncate_low = 0.0
 truncate_high = 1.0
 device = "mps"
+# PyTorch DataLoader workers (CPU-side prefetch). Often best left at 0 on small datasets.
+dataloader_num_workers = 0
 
 [training.quantile]
 quantiles = [0.5, 0.8, 0.9]
@@ -109,6 +114,8 @@ epochs = 60
 lr = 0.001
 batch_size = 512
 device = "mps"
+# PyTorch DataLoader workers (CPU-side prefetch).
+dataloader_num_workers = 0
 
 [checkpointing]
 # Save training checkpoints every N epochs.
@@ -145,6 +152,8 @@ epochs = 60
 lr = 0.001
 batch_size = 256
 device = "mps"
+# PyTorch DataLoader workers (CPU-side prefetch).
+dataloader_num_workers = 0
 
 [github]
 # Optional GitHub ingestion for PR metadata (Upgrade C).

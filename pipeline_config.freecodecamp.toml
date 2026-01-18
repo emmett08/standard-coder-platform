@@ -18,7 +18,8 @@ exclude_github_repos = []
 mirror_clone = true
 git_fetch_prune = true
 
-# Start with a cap; increase after you’ve validated runtime and output sizes.
+# Successful run complete: switch to a higher-quality default.
+# (You can always lower these again for fast iteration.)
 max_commits_per_repo = 10000
 
 [filters.authors]
@@ -40,7 +41,7 @@ base_dir = "~/.standard_coder_freecodecamp"
 [training]
 predictor_kind = "mdn"
 
-# Big-repo defaults: keep dataset size reasonable while you iterate.
+# This has a big effect on dataset size + runtime.
 label_samples_per_commit = 3
 rng_seed = 123
 
@@ -52,6 +53,9 @@ lr = 0.01
 hidden_size = 16
 min_commits_per_author = 100
 device = "mps"
+# Fit per-author HMMs in parallel on CPU.
+# Note: for torch MPS/CUDA devices this falls back to 1 worker.
+parallel_authors = 1
 
 [training.change_rep]
 # Upgrade A is Python-specific; disable for TS/JS repos.
@@ -68,6 +72,8 @@ batch_size = 512
 truncate_low = 0.0
 truncate_high = 1.0
 device = "mps"
+# PyTorch DataLoader workers (CPU-side prefetch). Often best left at 0 on small datasets.
+dataloader_num_workers = 0
 
 [checkpointing]
 save_every_epochs = 1
@@ -75,4 +81,3 @@ resume = true
 
 [forecasting]
 enable = false
-
