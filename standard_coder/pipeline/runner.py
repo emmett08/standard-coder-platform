@@ -90,6 +90,18 @@ def _prefer_mps(device: str | None) -> str | None:
     return "cpu"
 
 
+def _state_dict_compatible(
+    loaded: dict[str, torch.Tensor],
+    expected: dict[str, torch.Tensor],
+) -> bool:
+    if loaded.keys() != expected.keys():
+        return False
+    for key, value in loaded.items():
+        if value.shape != expected[key].shape:
+            return False
+    return True
+
+
 def _commit_time_minutes(c: Commit) -> int:
     return int(c.authored_at.timestamp() // 60)
 
@@ -669,10 +681,24 @@ class PipelineRunner:
         start_epoch = 0
         if ck_file.exists() and self.config.checkpointing.resume:
             payload = torch.load(ck_file, map_location="cpu")
-            net.load_state_dict(payload["net"])
-            opt.load_state_dict(payload["opt"])
-            start_epoch = int(payload["epoch"]) + 1
-            self.ui.log(f"Resuming MDN from epoch {start_epoch}.")
+            net_state = payload.get("net")
+            if isinstance(net_state, dict) and _state_dict_compatible(net_state, net.state_dict()):
+                net.load_state_dict(net_state)
+                opt_state = payload.get("opt")
+                if isinstance(opt_state, dict):
+                    try:
+                        opt.load_state_dict(opt_state)
+                    except RuntimeError:
+                        self.ui.log("MDN optimizer checkpoint incompatible; using fresh optimizer.")
+                ck_epoch = payload.get("epoch")
+                if isinstance(ck_epoch, (int, float)):
+                    start_epoch = int(ck_epoch) + 1
+                if start_epoch:
+                    self.ui.log(f"Resuming MDN from epoch {start_epoch}.")
+                else:
+                    self.ui.log("Resuming MDN from checkpoint.")
+            else:
+                self.ui.log("MDN checkpoint incompatible with current model; training from scratch.")
         else:
             self.ui.log("Training MDN from scratch.")
 
@@ -756,10 +782,26 @@ class PipelineRunner:
         start_epoch = 0
         if ck_file.exists() and self.config.checkpointing.resume:
             payload = torch.load(ck_file, map_location="cpu")
-            net.load_state_dict(payload["net"])
-            opt.load_state_dict(payload["opt"])
-            start_epoch = int(payload["epoch"]) + 1
-            self.ui.log(f"Resuming quantile model from epoch {start_epoch}.")
+            net_state = payload.get("net")
+            if isinstance(net_state, dict) and _state_dict_compatible(net_state, net.state_dict()):
+                net.load_state_dict(net_state)
+                opt_state = payload.get("opt")
+                if isinstance(opt_state, dict):
+                    try:
+                        opt.load_state_dict(opt_state)
+                    except RuntimeError:
+                        self.ui.log("Quantile optimizer checkpoint incompatible; using fresh optimizer.")
+                ck_epoch = payload.get("epoch")
+                if isinstance(ck_epoch, (int, float)):
+                    start_epoch = int(ck_epoch) + 1
+                if start_epoch:
+                    self.ui.log(f"Resuming quantile model from epoch {start_epoch}.")
+                else:
+                    self.ui.log("Resuming quantile model from checkpoint.")
+            else:
+                self.ui.log("Quantile checkpoint incompatible with current model; training from scratch.")
+        else:
+            self.ui.log("Training quantile model from scratch.")
 
         if device.type in ("mps", "cuda"):
             torch.set_float32_matmul_precision("high")
@@ -859,10 +901,26 @@ class PipelineRunner:
         start_epoch = 0
         if ck_file.exists() and self.config.checkpointing.resume:
             payload = torch.load(ck_file, map_location="cpu")
-            net.load_state_dict(payload["net"])
-            opt.load_state_dict(payload["opt"])
-            start_epoch = int(payload["epoch"]) + 1
-            self.ui.log(f"Resuming multi-task model from epoch {start_epoch}.")
+            net_state = payload.get("net")
+            if isinstance(net_state, dict) and _state_dict_compatible(net_state, net.state_dict()):
+                net.load_state_dict(net_state)
+                opt_state = payload.get("opt")
+                if isinstance(opt_state, dict):
+                    try:
+                        opt.load_state_dict(opt_state)
+                    except RuntimeError:
+                        self.ui.log("Multi-task optimizer checkpoint incompatible; using fresh optimizer.")
+                ck_epoch = payload.get("epoch")
+                if isinstance(ck_epoch, (int, float)):
+                    start_epoch = int(ck_epoch) + 1
+                if start_epoch:
+                    self.ui.log(f"Resuming multi-task model from epoch {start_epoch}.")
+                else:
+                    self.ui.log("Resuming multi-task model from checkpoint.")
+            else:
+                self.ui.log("Multi-task checkpoint incompatible with current model; training from scratch.")
+        else:
+            self.ui.log("Training multi-task model from scratch.")
 
         if device.type in ("mps", "cuda"):
             torch.set_float32_matmul_precision("high")

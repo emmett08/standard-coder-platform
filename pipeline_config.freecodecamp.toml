@@ -6,6 +6,15 @@
 # - other languages: JavaScript, CSS, HTML, Shell, Dockerfile
 #
 # Note: this pipeline’s mining language inference currently buckets TS+JS as "javascript".
+# After running the mine stage, generate a TOML include line from the mined DB:
+#   python - <<'PY'
+#   import os, sqlite3
+#   db = os.path.expanduser("~/.standard_coder_freecodecamp/raw/mined_commits.sqlite")
+#   rows = sqlite3.connect(db).execute(
+#       "select distinct language from commits order by language"
+#   ).fetchall()
+#   print("include = [" + ", ".join(f'"{r[0]}"' for r in rows) + "]")
+#   PY
 #
 # Run:
 #   standard-coder pipeline --config pipeline_config.freecodecamp.toml --stages mine
